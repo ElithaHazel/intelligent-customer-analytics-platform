@@ -33,17 +33,17 @@ As a result, business users struggle to:
 
 This project builds an end-to-end Customer Analytics Platform that:
 
-• Implements a Medallion Lakehouse Architecture using Delta Lake
+- Implements a Medallion Lakehouse Architecture using Delta Lake
 
-• Processes over 1.5 million records from 9 relational datasets
+- Processes over 1.5 million records from 9 relational datasets
 
-• Engineers RFM features for customer segmentation
+- Engineers RFM features for customer segmentation
 
-• Predicts high-value customers using XGBoost
+- Predicts high-value customers using XGBoost
 
-• Tracks experiments using MLflow
+- Tracks experiments using MLflow
 
-• Uses Retrieval-Augmented Generation (RAG) to answer business questions from customer reviews
+- Uses Retrieval-Augmented Generation (RAG) to answer business questions from customer reviews
 
 ---
 
@@ -94,6 +94,7 @@ RAG Knowledge Assistant
         │
         ▼
 Business Insights
+
 ```
 
 ---
@@ -110,6 +111,9 @@ Business Insights
 | 05_Gold_Layer_RFM | Feature engineering and customer segmentation |
 | 06_CLV_Model | Customer Lifetime Value prediction using XGBoost |
 | 07_RAG_Knowledge_Assistant | Semantic search over customer reviews |
+| 08_Model_Deployment | Batch inference and CLV tier deployment |
+| 09_Hyperparameter_Tuning | Hyperopt-based tuning of the CLV model |
+| 10_Temporal_CLV_Target | Leakage-free target using a temporal train/test split |
 
 ---
 
@@ -176,7 +180,24 @@ Total Customers
 
 Key Finding
 
-Recency was identified as the strongest predictor of Customer Lifetime Value.
+Recency was initially identified as the strongest predictor of Customer Lifetime Value. Further investigation (below) found this result to be inflated by target leakage — see the Model Development section for the corrected, honestly-measured finding.
+
+---
+
+## Model Development — Leakage Investigation & Fix
+
+The first modeling pass (V1/V2) predicted `is_high_value`, a label derived directly from percentile-ranked recency/frequency/monetary scores — the same features used to predict it. This produced near-perfect but meaningless metrics (V3, tuned: **ROC AUC 1.0000, accuracy 99.86%**), and a feature importance profile where `frequency` scored exactly 0% across every version — a clear signature of leakage rather than genuine signal.
+
+**The fix (V4):** redefined the target as `is_repeat_customer_90d` — whether a customer placed an order in the 90/180 days *after* a fixed cutoff date, using only recency/frequency/monetary computed *before* that cutoff. Features and label are now strictly time-separated.
+
+| Model | Target | ROC AUC | Notes |
+|-------|--------|--------:|-------|
+| V1/V2 | is_high_value (same-snapshot RFM threshold) | ~1.00 | Leaked — target derived from features |
+| V3 (tuned) | is_high_value | 1.0000 | Hyperopt-tuned, still leaked |
+| V4 (90-day window) | is_repeat_customer_90d | 0.5293 | Honest, weak signal |
+| V4 (180-day window) | is_repeat_customer_90d | 0.5461 | Honest, marginal improvement |
+
+**Conclusion:** once measured honestly, recency/frequency/monetary alone carry weak predictive power for *future* repeat purchase (AP lift of ~2.3–2.9x over base rate, ROC AUC only marginally above random). This is a legitimate finding, not a modeling failure — it indicates that a stronger CLV model would need richer features (review sentiment, product category, delivery experience, seasonality) rather than further tuning of the existing three features. Notably, `frequency` became the top feature in V4 (52.8% importance) once the leakage was removed — a meaningful behavioral signal that was completely invisible in the leaked V1–V3 models.
 
 ---
 
@@ -197,6 +218,32 @@ Example Questions
 
 ---
 
+# Pipeline Orchestration (Databricks Workflows)
+
+The full pipeline is orchestrated as a scheduled Databricks Workflow, structured as two branches from a shared feature layer:
+
+`ingest_bronze` → `bronze_layer` → `silver_layer` → `gold_layer_rfm`
+
+&nbsp;
+
+**After Gold Layer, the pipeline branches into:**
+
+| Production Path | Experimentation Path |
+|---|---|
+| `clv_model` | `experimental_hyperparameter_tuning` |
+| ↓ | ↓ |
+| `model_deployment` | `experimental_temporal_target` |
+
+- **Production path** deploys the current validated model (V2).
+- **Experimentation path** produces candidate models (V3 tuned, V4 leakage-free) without affecting what's deployed — a standard MLOps pattern for separating validated production models from active experimentation.
+- Scheduled to run **daily at 6:00 AM (America/New_York)**.
+- **Failure-only email notifications** configured — no noise on successful runs.
+- Verified with two full manual runs, all tasks across both branches succeeding, including the MLflow hand-off from the tuning task to the temporal-target task.
+
+Note: Free Edition supports Workflows with limits (5 concurrent job tasks, 1 active pipeline per type) — this project's DAG runs within those limits.
+
+---
+
 # Business Value
 
 The platform enables organizations to:
@@ -211,11 +258,18 @@ The platform enables organizations to:
 
 # Future Enhancements
 
-- Hyperparameter Optimization
-- Model Deployment
-- Databricks Workflows
+**Completed:**
+- ~~Hyperparameter Optimization~~ — Hyperopt/TPE tuning (09)
+- ~~Model Deployment~~ — batch CLV tier deployment (08)
+- ~~Databricks Workflows~~ — scheduled, branched DAG with production/experimentation split
+- ~~Leakage-free CLV target~~ — temporal train/test split (10)
+
+**Pending:**
+- Real-time model serving (MLflow Model Serving REST endpoint, wrapping V4)
+- LLM synthesis for RAG (replace structured extraction with a real LLM generation call, exposed as an endpoint)
+- Drift monitoring (track recency/frequency/monetary distribution drift against training baseline)
+- Richer feature engineering for CLV (review sentiment, product category, delivery experience, seasonality) — the natural next step identified by the V4 leakage investigation
 - Interactive Business Dashboard
-- Production RAG Deployment
 
 ---
 
